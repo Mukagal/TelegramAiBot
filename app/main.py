@@ -2,18 +2,28 @@ import os
 import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
-
+from dotenv import load_dotenv
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).parent.parent / ".env"
+    load_dotenv(dotenv_path=_env_path)
+except ImportError:
+    pass
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN is not set! Copy .env.example → .env and fill it.")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is not set!")
 
 KNOWLEDGE_FILE = Path(__file__).parent.parent / "data" / "company_knowledge.txt"
 COMPANY_CONTEXT = KNOWLEDGE_FILE.read_text(encoding="utf-8")
@@ -71,7 +81,7 @@ async def send_typing(chat_id: int):
         await client.post(url, json={"chat_id": chat_id, "action": "typing"})
 
 
-async def ask_claude(chat_id: int, user_text: str) -> str:
+async def ask_openai(chat_id: int, user_text: str) -> str:
     history = conversation_store.setdefault(chat_id, [])
 
     history.append({"role": "user", "content": user_text})
@@ -81,27 +91,28 @@ async def ask_claude(chat_id: int, user_text: str) -> str:
         conversation_store[chat_id] = history
 
     headers = {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
         "content-type": "application/json",
     }
     payload = {
-        "model": "claude-sonnet-4-20250514",
+        "model": "gpt-4o-mini",
         "max_tokens": 1024,
-        "system": SYSTEM_PROMPT,
-        "messages": history,
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + history,
+        "temperature": 0.3, 
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
-            "https://api.anthropic.com/v1/messages",
+            "https://api.openai.com/v1/chat/completions",
             headers=headers,
             json=payload,
         )
+        if not resp.is_success:
+            logger.error("Anthropic %s: %s", resp.status_code, resp.text)
         resp.raise_for_status()
         data = resp.json()
 
-    assistant_text = data["content"][0]["text"]
+    assistant_text = data["choices"][0]["message"]["content"]
 
     history.append({"role": "assistant", "content": assistant_text})
 
@@ -150,9 +161,9 @@ async def webhook(request: Request):
     await send_typing(chat_id)
 
     try:
-        reply = await ask_claude(chat_id, text)
+        reply = await ask_openai(chat_id, text)
     except httpx.HTTPStatusError as e:
-        logger.error("Anthropic API error: %s", e)
+        logger.error("OpenAI API error: %s", e)
         reply = (
             "Извините, произошла техническая ошибка. "
             "Пожалуйста, попробуйте позже или свяжитесь с нами: "
@@ -203,7 +214,7 @@ async def poll():
                         continue
                     await send_typing(chat_id)
                     try:
-                        reply = await ask_claude(chat_id, text)
+                        reply = await ask_openai(chat_id, text)
                     except Exception as e:
                         logger.error("Error: %s", e)
                         reply = "Ошибка. Попробуйте позже или позвоните: +7 (778) 061-50-00"
