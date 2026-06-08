@@ -1,12 +1,14 @@
 import os
 import logging
+import time
 from pathlib import Path
 from contextlib import asynccontextmanager
+from collections import defaultdict
 from dotenv import load_dotenv
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+
 try:
     from dotenv import load_dotenv
     _env_path = Path(__file__).parent.parent / ".env"
@@ -19,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  
+WEBHOOK_URL    = os.getenv("WEBHOOK_URL", "")
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set! Copy .env.example → .env and fill it.")
 if not OPENAI_API_KEY:
@@ -45,7 +47,48 @@ SYSTEM_PROMPT = f"""Ты — AI-ассистент интернет-магази
 """
 
 conversation_store: dict[int, list[dict]] = {}
-MAX_HISTORY = 10  
+MAX_HISTORY = 10
+
+# ---------------------------------------------------------------------------
+# Rate limiting — configure via .env
+# ---------------------------------------------------------------------------
+USER_MAX_MESSAGES_PER_HOUR = int(os.getenv("USER_MAX_MSG_PER_HOUR", "10"))
+GLOBAL_MAX_TOKENS_PER_DAY  = int(os.getenv("GLOBAL_MAX_TOKENS_PER_DAY", "200000"))
+AVG_TOKENS_PER_REQUEST     = 1500  # fallback estimate if OpenAI usage missing
+
+_user_message_times: dict[int, list[float]] = defaultdict(list)
+_global_token_budget: dict = {"date": "", "tokens": 0}
+
+
+def _today() -> str:
+    from datetime import date
+    return date.today().isoformat()
+
+
+def _check_user_rate(chat_id: int) -> bool:
+    """Return True if user is within their hourly message limit."""
+    now = time.monotonic()
+    window = now - 3600
+    times = _user_message_times[chat_id]
+    times[:] = [t for t in times if t > window]
+    if len(times) >= USER_MAX_MESSAGES_PER_HOUR:
+        return False
+    times.append(now)
+    return True
+
+
+def _check_global_budget(tokens_used: int = 0) -> bool:
+    """Return True if daily token budget is not exhausted.
+    Pass tokens_used > 0 to record actual consumption after a call.
+    """
+    today = _today()
+    if _global_token_budget["date"] != today:
+        _global_token_budget["date"] = today
+        _global_token_budget["tokens"] = 0
+    _global_token_budget["tokens"] += tokens_used
+    return _global_token_budget["tokens"] < GLOBAL_MAX_TOKENS_PER_DAY
+
+# ---------------------------------------------------------------------------
 
 
 @asynccontextmanager
@@ -83,7 +126,6 @@ async def send_typing(chat_id: int):
 
 async def ask_openai(chat_id: int, user_text: str) -> str:
     history = conversation_store.setdefault(chat_id, [])
-
     history.append({"role": "user", "content": user_text})
 
     if len(history) > MAX_HISTORY * 2:
@@ -98,7 +140,7 @@ async def ask_openai(chat_id: int, user_text: str) -> str:
         "model": "gpt-4o-mini",
         "max_tokens": 1024,
         "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + history,
-        "temperature": 0.3, 
+        "temperature": 0.3,
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
@@ -108,14 +150,20 @@ async def ask_openai(chat_id: int, user_text: str) -> str:
             json=payload,
         )
         if not resp.is_success:
-            logger.error("Anthropic %s: %s", resp.status_code, resp.text)
+            logger.error("OpenAI %s: %s", resp.status_code, resp.text)
         resp.raise_for_status()
         data = resp.json()
 
     assistant_text = data["choices"][0]["message"]["content"]
 
-    history.append({"role": "assistant", "content": assistant_text})
+    # Record actual token usage against the global daily budget
+    usage = data.get("usage", {})
+    total_tokens = usage.get("total_tokens", AVG_TOKENS_PER_REQUEST)
+    _check_global_budget(tokens_used=total_tokens)
+    logger.info("Tokens used this request: %d | Daily total: %d / %d",
+                total_tokens, _global_token_budget["tokens"], GLOBAL_MAX_TOKENS_PER_DAY)
 
+    history.append({"role": "assistant", "content": assistant_text})
     return assistant_text
 
 
@@ -127,6 +175,19 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+@app.get("/stats")
+async def stats():
+    """Live view of rate-limit state — protect this endpoint in production."""
+    return {
+        "global_tokens_today":    _global_token_budget["tokens"],
+        "global_token_limit":     GLOBAL_MAX_TOKENS_PER_DAY,
+        "global_budget_remaining": max(0, GLOBAL_MAX_TOKENS_PER_DAY - _global_token_budget["tokens"]),
+        "date":                   _global_token_budget["date"],
+        "user_hourly_limit":      USER_MAX_MESSAGES_PER_HOUR,
+        "active_user_sessions":   len(_user_message_times),
+    }
 
 
 @app.post("/webhook")
@@ -158,6 +219,27 @@ async def webhook(request: Request):
     if text.startswith("/"):
         return JSONResponse({"ok": True})
 
+    # --- Rate limiting ---
+    if not _check_user_rate(chat_id):
+        await send_message(
+            chat_id,
+            f"⏳ Вы отправили слишком много сообщений. "
+            f"Лимит: {USER_MAX_MESSAGES_PER_HOUR} сообщений в час.\n"
+            "Пожалуйста, попробуйте позже или позвоните нам: +7 (778) 061-50-00"
+        )
+        return JSONResponse({"ok": True})
+
+    if not _check_global_budget():
+        logger.warning("Global daily token budget exhausted!")
+        await send_message(
+            chat_id,
+            "😔 Ассистент временно недоступен — достигнут дневной лимит запросов.\n"
+            "Пожалуйста, свяжитесь с нами напрямую: +7 (778) 061-50-00 "
+            "или info.online@abis.kz"
+        )
+        return JSONResponse({"ok": True})
+    # --- End rate limiting ---
+
     await send_typing(chat_id)
 
     try:
@@ -171,9 +253,7 @@ async def webhook(request: Request):
         )
     except Exception as e:
         logger.error("Unexpected error: %s", e)
-        reply = (
-            "Что-то пошло не так. Пожалуйста, попробуйте ещё раз."
-        )
+        reply = "Что-то пошло не так. Пожалуйста, попробуйте ещё раз."
 
     await send_message(chat_id, reply)
     return JSONResponse({"ok": True})
@@ -213,6 +293,25 @@ async def poll():
                     if text.startswith("/"):
                         continue
                     await send_typing(chat_id)
+                    # --- Rate limiting ---
+                    if not _check_user_rate(chat_id):
+                        await send_message(
+                            chat_id,
+                            f"⏳ Вы отправили слишком много сообщений. "
+                            f"Лимит: {USER_MAX_MESSAGES_PER_HOUR} сообщений в час.\n"
+                            "Пожалуйста, попробуйте позже или позвоните нам: +7 (778) 061-50-00"
+                        )
+                        continue
+                    if not _check_global_budget():
+                        logger.warning("Global daily token budget exhausted!")
+                        await send_message(
+                            chat_id,
+                            "😔 Ассистент временно недоступен — достигнут дневной лимит запросов.\n"
+                            "Пожалуйста, свяжитесь с нами напрямую: +7 (778) 061-50-00 "
+                            "или info.online@abis.kz"
+                        )
+                        continue
+                    # --- End rate limiting ---
                     try:
                         reply = await ask_openai(chat_id, text)
                     except Exception as e:
